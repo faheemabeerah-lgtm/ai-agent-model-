@@ -1,151 +1,196 @@
 import os
-
 import streamlit as st
+
+# Fix the CrewAI/Groq cache_breakpoint error.
+# IMPORTANT: run this before importing Agent, Crew, LLM, or Task.
+import crewai.llms.cache as crew_cache
+
+crew_cache.mark_cache_breakpoint = lambda msg: msg
+
 from crewai import Agent, Crew, LLM, Process, Task
-from crewai.tools import BaseTool
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
-MODEL_NAME = "openai/gpt-oss-120b"
-
-
-class DuckDuckGoSearchTool(BaseTool):
-    name: str = "DuckDuckGo Web Search"
-    description: str = (
-        "Search the web with DuckDuckGo. Use this to find current information, "
-        "facts, and useful sources about the research topic."
-    )
-
-    def _run(self, query: str) -> str:
-        try:
-            results = DDGS().text(query, max_results=5)
-            if not results:
-                return "No search results were found."
-
-            lines = []
-            for i, result in enumerate(results, start=1):
-                title = result.get("title", "Untitled")
-                body = result.get("body", "")
-                href = result.get("href", "")
-                lines.append(f"{i}. {title}\n{body}\nSource: {href}")
-
-            return "\n\n".join(lines)
-        except Exception as exc:
-            return f"Search failed: {exc}"
-
-
-def create_research_crew(topic: str) -> Crew:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY is missing.")
-
-    llm = LLM(
-        model=f"groq/{MODEL_NAME}",
-        api_key=api_key,
-        temperature=0.2,
-        max_tokens=6000,
-    )
-
-    search_tool = DuckDuckGoSearchTool()
-
-    researcher = Agent(
-        role="AI Research Analyst",
-        goal=(
-            "Research the user's topic using reliable web sources and produce "
-            "an accurate, balanced, well-organized research report."
-        ),
-        backstory=(
-            "You are a careful research analyst. You search for current information, "
-            "compare sources, avoid unsupported claims, and clearly identify sources."
-        ),
-        tools=[search_tool],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False,
-    )
-
-    task = Task(
-        description=f"""
-Research the following topic:
-
-{topic}
-
-Use the web search tool to gather information from multiple relevant sources.
-
-Write a beginner-friendly research report with these sections:
-1. Title
-2. Executive Summary
-3. Introduction
-4. Key Findings
-5. Detailed Discussion
-6. Advantages / Benefits (when relevant)
-7. Challenges / Limitations (when relevant)
-8. Conclusion
-9. Sources
-
-Important:
-- Prefer recent and credible sources.
-- Do not invent facts or citations.
-- Include source URLs in the Sources section when available.
-- Clearly distinguish established facts from interpretation.
-- Keep the report informative and easy to understand.
-""",
-        expected_output="A complete, well-structured research report with a source list.",
-        agent=researcher,
-    )
-
-    return Crew(
-        agents=[researcher],
-        tasks=[task],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-
+# -----------------------------
+# Streamlit page configuration
+# -----------------------------
 st.set_page_config(
     page_title="AI Research Agent",
     page_icon="🔎",
-    layout="wide",
+    layout="wide"
 )
 
 st.title("🔎 AI Research Agent")
 st.write(
-    "Enter a topic and let a CrewAI research agent search the web and create a report."
+    "Enter a research topic to search the web "
+    "and generate a structured research report."
 )
 
+
+# -----------------------------
+# Configure Groq
+# -----------------------------
+api_key = os.getenv("GROQ_API_KEY")
+
+if not api_key:
+    st.error(
+        "GROQ_API_KEY is missing. "
+        "Add it in Streamlit Cloud → Manage app → Settings → Secrets."
+    )
+    st.stop()
+
+llm = LLM(
+    model="groq/openai/gpt-oss-120b",
+    api_key=api_key
+)
+
+
+# -----------------------------
+# Research topic input
+# -----------------------------
 topic = st.text_area(
-    "Research topic",
-    placeholder="Example: The impact of artificial intelligence on education",
-    height=120,
+    "Enter your research topic",
+    placeholder="Example: The impact of AI on education",
+    height=100
 )
 
-if st.button("🚀 Start Research", type="primary"):
+generate = st.button(
+    "Generate Research Report",
+    type="primary"
+)
+
+
+# -----------------------------
+# Search the web
+# -----------------------------
+def search_web(query):
+    results = []
+
+    with DDGS() as search:
+        for item in search.text(query, max_results=8):
+            results.append({
+                "title": item.get("title", "Untitled"),
+                "url": item.get("href", ""),
+                "snippet": item.get("body", "")
+            })
+
+    return results
+
+
+# -----------------------------
+# Generate research report
+# -----------------------------
+if generate:
     if not topic.strip():
         st.warning("Please enter a research topic.")
-    elif not os.getenv("GROQ_API_KEY"):
-        st.error(
-            "GROQ_API_KEY is missing. Add it to your environment variables "
-            "or Streamlit Cloud Secrets."
+        st.stop()
+
+    try:
+        with st.spinner("Searching the web..."):
+            search_results = search_web(topic)
+
+        if not search_results:
+            st.warning(
+                "No search results were found. "
+                "Please try another topic."
+            )
+            st.stop()
+
+        # Give the agent the actual search results.
+        sources_text = "\n\n".join(
+            f"Title: {item['title']}\n"
+            f"URL: {item['url']}\n"
+            f"Snippet: {item['snippet']}"
+            for item in search_results
         )
-    else:
-        with st.spinner("Researching the topic and writing your report..."):
-            try:
-                crew = create_research_crew(topic.strip())
-                result = crew.kickoff()
-                report = str(result)
 
-                st.success("Research completed!")
-                st.markdown(report)
+        researcher = Agent(
+            role="AI Research Analyst",
+            goal=(
+                "Create accurate, clear, well-organized research "
+                "reports supported by the provided web sources."
+            ),
+            backstory=(
+                "You are a careful research analyst. "
+                "You distinguish evidence from assumptions and "
+                "never invent sources or claim to have verified "
+                "facts that the evidence does not support."
+            ),
+            llm=llm,
+            verbose=False,
+            allow_delegation=False
+        )
 
-                st.download_button(
-                    "⬇️ Download Report",
-                    data=report,
-                    file_name="research_report.md",
-                    mime="text/markdown",
-                )
-            except Exception as exc:
-                st.error(f"Something went wrong: {exc}")
-                st.info(
-                    "Check that your GROQ_API_KEY is valid and that all packages "
-                    "from requirements.txt were installed successfully."
-                )
+        research_task = Task(
+            description=f"""
+Research topic: {topic}
+
+Use the following DuckDuckGo web search results as your
+starting evidence:
+
+{sources_text}
+
+Write a detailed report with these sections:
+
+1. Title
+2. Executive summary
+3. Introduction
+4. Key findings
+5. Benefits and opportunities
+6. Challenges and limitations
+7. Conclusion
+8. References
+
+Requirements:
+- Use clear, beginner-friendly language.
+- Base factual claims on the provided search results.
+- Include relevant source URLs beside the claims they support.
+- Do not invent statistics, quotations, or references.
+- If evidence is insufficient, state that clearly.
+- Explain conflicting evidence where relevant.
+- Do not claim that you opened or read full articles unless
+  their content was actually provided.
+""",
+            expected_output=(
+                "A well-structured research report with key findings, "
+                "balanced analysis, a conclusion, and source URLs."
+            ),
+            agent=researcher
+        )
+
+        crew = Crew(
+            agents=[researcher],
+            tasks=[research_task],
+            process=Process.sequential,
+            verbose=False
+        )
+
+        with st.spinner("Writing your research report..."):
+            result = crew.kickoff()
+
+        report = str(result)
+
+        st.success("Research report generated!")
+        st.markdown(report)
+
+        st.download_button(
+            label="Download Research Report",
+            data=report,
+            file_name="research_report.md",
+            mime="text/markdown"
+        )
+
+        with st.expander("View web search results"):
+            for item in search_results:
+                st.markdown(f"**{item['title']}**")
+                st.write(item["snippet"])
+                if item["url"]:
+                    st.markdown(f"[Open source]({item['url']})")
+
+    except Exception as error:
+        st.error("The research report could not be generated.")
+        st.code(f"{type(error).__name__}: {error}")
+        st.info(
+            "Check the Streamlit Secrets, installed package versions, "
+            "Groq model availability, and deployment logs."
+        )
